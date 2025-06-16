@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 	"github.com/tebeka/selenium/chrome"
 )
 
-func duckduckgoDorking(query string, maxClicks int, verbose bool) {
+func duckduckgoDorking(query string, period string, maxClicks int, verbose bool) {
 	const port = 9515
 
 	service, err := selenium.NewChromeDriverService("chromedriver", port)
@@ -36,8 +37,13 @@ func duckduckgoDorking(query string, maxClicks int, verbose bool) {
 	}
 	defer wd.Quit()
 
-	url := fmt.Sprintf("https://duckduckgo.com/?q=%s", query)
-	if err := wd.Get(url); err != nil {
+	escapedQuery := url.QueryEscape(query)
+	searchURL := fmt.Sprintf("https://duckduckgo.com/?q=%s&t=h_&ia=web", escapedQuery)
+	if period != "" {
+		searchURL = fmt.Sprintf("%s&df=%s", searchURL, period)
+	}
+
+	if err := wd.Get(searchURL); err != nil {
 		log.Fatalf("Error loading the page: %v", err)
 	}
 
@@ -96,6 +102,11 @@ func main() {
 	clicks := flag.Int("c", 10, "Maximum number of clicks to load more results (default: 10)")
 	verbose := flag.Bool("v", false, "Show additional status messages")
 
+	day := flag.Bool("day", false, "Search results from the last day")
+	week := flag.Bool("week", false, "Search results from the last week")
+	month := flag.Bool("month", false, "Search results from the last month")
+	year := flag.Bool("year", false, "Search results from the last year")
+
 	flag.Parse()
 
 	if *query == "" {
@@ -104,5 +115,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	duckduckgoDorking(*query, *clicks, *verbose)
+	var period string
+	if *day {
+		period = "d"
+	} else if *week {
+		period = "w"
+	} else if *month {
+		period = "m"
+	} else if *year {
+		period = "y"
+	}
+
+	duckduckgoDorking(*query, period, *clicks, *verbose)
 }
