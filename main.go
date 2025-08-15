@@ -50,25 +50,25 @@ func duckduckgoDorking(query string, period string, maxPages int, verbose bool) 
 		log.Fatalf("Error loading the page: %v", err)
 	}
 
-	// Espera os primeiros resultados aparecerem
+	// Seletor resiliente para os links de resultado
 	selector := "h2 > a, a[data-testid='result-title-a']"
+
+	// Espera primeiros resultados
 	if err := wd.WaitWithTimeout(func(w selenium.WebDriver) (bool, error) {
 		els, _ := w.FindElements(selenium.ByCSSSelector, selector)
 		return len(els) > 0, nil
-	}, 15*time.Second); err != nil {
-		if verbose {
-			title, _ := wd.Title()
-			html, _ := wd.PageSource()
-			fmt.Println("[warn] Nenhum resultado visível após timeout. Title:", title)
-			fmt.Println("[debug] Primeiros 500 chars do HTML:", runesPrefix(html, 500))
-		}
+	}, 15*time.Second); err != nil && verbose {
+		title, _ := wd.Title()
+		html, _ := wd.PageSource()
+		fmt.Println("[warn] Nenhum resultado visível após timeout. Title:", title)
+		fmt.Println("[debug] Primeiros 500 chars do HTML:", runesPrefix(html, 500))
 	}
 
 	all := make(map[string]bool)
 	prevCount := 0
 
 	for page := 0; page < maxPages; page++ {
-		// Coleta dos links da página atual
+		// Coleta links atuais (imprime só novos)
 		els, _ := wd.FindElements(selenium.ByCSSSelector, selector)
 		for _, e := range els {
 			href, _ := e.GetAttribute("href")
@@ -77,32 +77,95 @@ func duckduckgoDorking(query string, period string, maxPages int, verbose bool) 
 				fmt.Println(href)
 			}
 		}
+		prevCount = len(els)
 
-		// Scroll infinito — rola até o fim e aguarda novos resultados
-		_, _ = wd.ExecuteScript("window.scrollTo(0, document.body.scrollHeight);", nil)
+		// Tentar carregar mais (botão OU scroll incremental)
+		clicked := tryLoadMore(wd, verbose)
 
-		// Aguarda aumento na contagem de resultados (~6s)
-		increased := false
-		for i := 0; i < 12; i++ {
-			time.Sleep(500 * time.Millisecond)
-			cur, _ := wd.FindElements(selenium.ByCSSSelector, selector)
-			if len(cur) > prevCount {
-				prevCount = len(cur)
-				increased = true
-				break
-			}
-		}
+		// Espera subir a contagem de resultados (até ~8s)
+		increased := waitGrowth(wd, selector, prevCount, 8*time.Second)
+
 		if verbose {
-			if increased {
-				fmt.Printf("[info] Página lógica %d carregada, total de elementos: %d\n", page+1, prevCount)
-			} else {
-				fmt.Println("[info] Parece que não há mais resultados para carregar.")
+			switch {
+			case increased:
+				fmt.Printf("[info] Mais resultados carregados (iter %d). total elems: %d\n", page+1, prevCount)
+			case clicked:
+				fmt.Println("[info] Cliquei no botão de mais resultados, mas não vi aumento. Vou parar.")
+			default:
+				fmt.Println("[info] Não há botão e o scroll não aumentou a contagem. Fim.")
 			}
 		}
 		if !increased {
 			break
 		}
 	}
+}
+
+// aguarda aumento da contagem de elementos que casam com o seletor
+func waitGrowth(wd selenium.WebDriver, selector string, prev int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		cur, _ := wd.FindElements(selenium.ByCSSSelector, selector)
+		if len(cur) > prev {
+			return true
+		}
+	}
+	return false
+}
+
+// tenta clicar no botão "More results"; se não existir, faz scroll incremental até o fim
+func tryLoadMore(wd selenium.WebDriver, verbose bool) bool {
+	// 1) Diversos seletores possíveis do botão
+	btnSelectors := []string{
+		"#more-results",
+		"a.result--more__btn",
+		"button.result--more__btn",
+		"a[aria-label*='More']",
+		"button[aria-label*='More']",
+		"button:has(span:contains('More'))", // pode não funcionar em todos os engines, mas tentamos
+	}
+
+	for _, q := range btnSelectors {
+		btns, _ := wd.FindElements(selenium.ByCSSSelector, q)
+		if len(btns) > 0 {
+			btn := btns[0]
+			_, _ = wd.ExecuteScript("arguments[0].scrollIntoView({block:'center'});", []interface{}{btn})
+			// tenta click normal
+			if err := btn.Click(); err != nil {
+				// força via JS se o click normal falhar
+				_, _ = wd.ExecuteScript("arguments[0].click();", []interface{}{btn})
+			}
+			if verbose {
+				fmt.Println("[info] Cliquei no botão de mais resultados:", q)
+			}
+			// espera um pouco para o carregamento começar
+			time.Sleep(1200 * time.Millisecond)
+			return true
+		}
+	}
+
+	// 2) Sem botão? Faz scroll incremental forte até o rodapé
+	docH, _ := wd.ExecuteScript("return document.body.scrollHeight;", nil)
+	startH := int64(0)
+	if v, ok := docH.(float64); ok {
+		startH = int64(v)
+	}
+	for i := 0; i < 6; i++ { // ~6 passos de scroll
+		_, _ = wd.ExecuteScript("window.scrollBy(0, window.innerHeight*0.9);", nil)
+		time.Sleep(600 * time.Millisecond)
+	}
+	// mais uma descida ao fundo
+	_, _ = wd.ExecuteScript("window.scrollTo(0, document.body.scrollHeight);", nil)
+	time.Sleep(1200 * time.Millisecond)
+
+	// se a altura do documento mudou, aumentou conteúdo -> retorno “true” (houve ação)
+	newHraw, _ := wd.ExecuteScript("return document.body.scrollHeight;", nil)
+	newH := startH
+	if v, ok := newHraw.(float64); ok {
+		newH = int64(v)
+	}
+	return newH > startH
 }
 
 // helper para truncar impressão de HTML no -v
@@ -116,7 +179,7 @@ func runesPrefix(s string, n int) string {
 
 func main() {
 	query := flag.String("q", "", "Query to search on DuckDuckGo")
-	clicks := flag.Int("c", 10, "Max scroll loads to fetch more results (default: 10)")
+	clicks := flag.Int("c", 10000, "Max scroll loads to fetch more results (default: 10)")
 	verbose := flag.Bool("v", false, "Show additional status messages")
 
 	day := flag.Bool("day", false, "Search results from the last day")
