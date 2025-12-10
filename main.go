@@ -207,10 +207,21 @@ func collectAndPrint(wd selenium.WebDriver, els []selenium.WebElement, seen map[
 		if href == "" {
 			continue
 		}
+
 		h := strings.TrimSpace(href)
+
+		// [FIX] Filtro Anti-Ad / Anti-Tracking
+		// Remove links internos do DuckDuckGo (Ads usam y.js) e links vazios
+		if strings.Contains(h, "duckduckgo.com") ||
+			strings.Contains(h, "y.js") ||
+			strings.Contains(h, "ad_domain") {
+			continue
+		}
+
 		if h == "" {
 			continue
 		}
+
 		if _, ok := seen[h]; !ok {
 			seen[h] = struct{}{}
 			fmt.Println(h)
