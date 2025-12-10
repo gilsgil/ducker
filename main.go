@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net" // [FIX] Necessário para encontrar porta livre
 	"net/url"
 	"os"
 	"strings"
@@ -14,9 +15,10 @@ import (
 	"github.com/tebeka/selenium/chrome"
 )
 
-const (
-	chromeDriverPort = 9515
-)
+// [FIX] Constante removida, agora usamos porta dinâmica
+// const (
+// 	chromeDriverPort = 9515
+// )
 
 // ---------- Utilidades ----------
 
@@ -33,16 +35,43 @@ func runesPrefix(s string, n int) string {
 	return string(rs[:n])
 }
 
+// [FIX] Função para obter uma porta TCP livre no sistema
+func getFreePort() (int, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		return 0, err
+	}
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
 // ---------- Núcleo ----------
 
 func duckduckgoDorking(query, period string, verbose bool, stallLimit int, lang string) {
 	rand.Seed(time.Now().UnixNano())
 
-	// Sobe ChromeDriver
-	svc, err := selenium.NewChromeDriverService("chromedriver", chromeDriverPort)
+	// [FIX] Obtém porta livre
+	port, err := getFreePort()
+	if err != nil {
+		log.Fatalf("Erro ao obter porta livre: %v", err)
+	}
+
+	if verbose {
+		fmt.Printf("[debug] Usando porta dinâmica: %d\n", port)
+	}
+
+	// Sobe ChromeDriver na porta dinâmica
+	opts := []selenium.ServiceOption{} // Adicione opções de log aqui se precisar depurar o driver
+	svc, err := selenium.NewChromeDriverService("chromedriver", port, opts...)
 	if err != nil {
 		log.Fatalf("Erro iniciando ChromeDriver: %v", err)
 	}
+	// O defer aqui só funciona se o programa sair "naturalmente".
+	// Se der Fatalf abaixo, ele não roda, por isso precisamos tratar o erro do NewRemote.
 	defer svc.Stop()
 
 	// Caps do Chrome
@@ -66,8 +95,11 @@ func duckduckgoDorking(query, period string, verbose bool, stallLimit int, lang 
 	}
 	caps.AddChrome(chromeCaps)
 
-	wd, err := selenium.NewRemote(caps, fmt.Sprintf("http://localhost:%d/wd/hub", chromeDriverPort))
+	// Conecta no WebDriver usando a porta correta
+	wd, err := selenium.NewRemote(caps, fmt.Sprintf("http://localhost:%d/wd/hub", port))
 	if err != nil {
+		// [FIX] Limpeza explícita: Se falhar a conexão, matamos o serviço antes do Fatalf
+		_ = svc.Stop()
 		log.Fatalf("Erro conectando no WebDriver: %v", err)
 	}
 	defer wd.Quit()
@@ -91,9 +123,7 @@ func duckduckgoDorking(query, period string, verbose bool, stallLimit int, lang 
 	// Possível banner de consentimento/captcha
 	handleConsentAndCaptcha(wd, verbose)
 
-	// Seletor dos resultados (DDG muda às vezes; mantemos dois caminhos)
-	// - a[data-testid='result-title-a'] é o mais estável hoje
-	// - fallback em h2 > a
+	// Seletor dos resultados
 	resultSelectors := []string{
 		"a[data-testid='result-title-a']",
 		"h2 > a",
@@ -104,7 +134,8 @@ func duckduckgoDorking(query, period string, verbose bool, stallLimit int, lang 
 		title, _ := wd.Title()
 		html, _ := wd.PageSource()
 		fmt.Println("[warn] Nenhum resultado visível após timeout. Title:", title)
-		fmt.Println("[debug] HTML(500):", runesPrefix(html, 500))
+		// debug reduzido
+		fmt.Println("[debug] HTML parcial:", runesPrefix(html, 200))
 	}
 
 	seen := make(map[string]struct{})
@@ -132,13 +163,12 @@ func duckduckgoDorking(query, period string, verbose bool, stallLimit int, lang 
 			}
 		}
 
-		// Se ficou “estagnado” muitas vezes, tentamos reforçar carregamento (clique + scroll forte)
+		// Se ficou “estagnado” muitas vezes, tentamos reforçar carregamento
 		if stallCount > 0 {
 			clicked := tryClickMore(wd, verbose)
 			if clicked {
 				humanPause(800*time.Millisecond, 1500*time.Millisecond)
 			} else {
-				// Scroll forte
 				strongScroll(wd)
 				humanPause(1200*time.Millisecond, 2200*time.Millisecond)
 			}
@@ -159,7 +189,6 @@ func duckduckgoDorking(query, period string, verbose bool, stallLimit int, lang 
 			}
 		}
 
-		// Se batemos o limite de estagnação, acabou
 		if stallCount >= stallLimit {
 			if verbose {
 				fmt.Println("[info] nenhum crescimento após várias tentativas; fim dos resultados.")
@@ -167,7 +196,6 @@ func duckduckgoDorking(query, period string, verbose bool, stallLimit int, lang 
 			break
 		}
 
-		// Toque leve entre ciclos
 		humanPause(600*time.Millisecond, 1400*time.Millisecond)
 	}
 }
@@ -177,10 +205,8 @@ func collectAndPrint(wd selenium.WebDriver, els []selenium.WebElement, seen map[
 	for _, e := range els {
 		href, _ := e.GetAttribute("href")
 		if href == "" {
-			// alguns títulos são <a> sem href e o link verdadeiro fica no parent – ignoramos
 			continue
 		}
-		// normaliza
 		h := strings.TrimSpace(href)
 		if h == "" {
 			continue
@@ -193,7 +219,6 @@ func collectAndPrint(wd selenium.WebDriver, els []selenium.WebElement, seen map[
 	return len(seen) - countBefore
 }
 
-// tenta clicar no botão "More results"
 func tryClickMore(wd selenium.WebDriver, verbose bool) bool {
 	btnSelectors := []string{
 		"#more-results",
@@ -209,13 +234,10 @@ func tryClickMore(wd selenium.WebDriver, verbose bool) bool {
 			continue
 		}
 		btn := btns[0]
-		// traz ao viewport
 		_, _ = wd.ExecuteScript("arguments[0].scrollIntoView({block:'center'});", []interface{}{btn})
 		humanPause(200*time.Millisecond, 500*time.Millisecond)
 
-		// tenta click normal primeiro
 		if err := btn.Click(); err != nil {
-			// força via JS
 			_, _ = wd.ExecuteScript("arguments[0].click();", []interface{}{btn})
 		}
 		if verbose {
@@ -226,18 +248,14 @@ func tryClickMore(wd selenium.WebDriver, verbose bool) bool {
 	return false
 }
 
-// scroll forte ao fundo + pequenas etapas
 func strongScroll(wd selenium.WebDriver) {
-	// passos incrementais
 	for i := 0; i < 8; i++ {
 		_, _ = wd.ExecuteScript("window.scrollBy(0, Math.floor(window.innerHeight*0.9));", nil)
 		time.Sleep(250 * time.Millisecond)
 	}
-	// vai ao fundo
 	_, _ = wd.ExecuteScript("window.scrollTo(0, document.body.scrollHeight);", nil)
 }
 
-// espera qualquer seletor aparecer
 func waitAnyVisible(wd selenium.WebDriver, selectors []string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -252,9 +270,7 @@ func waitAnyVisible(wd selenium.WebDriver, selectors []string, timeout time.Dura
 	return fmt.Errorf("timeout esperando resultados")
 }
 
-// tenta lidar com consentimento/captcha básicos
 func handleConsentAndCaptcha(wd selenium.WebDriver, verbose bool) {
-	// consentimentos comuns
 	consentSelectors := []string{
 		"form[action*='consent'] button[type='submit']",
 		"button#consent-accept-button",
@@ -274,7 +290,6 @@ func handleConsentAndCaptcha(wd selenium.WebDriver, verbose bool) {
 		}
 	}
 
-	// detecção de captcha (heurística)
 	html, _ := wd.PageSource()
 	if strings.Contains(strings.ToLower(html), "unusual traffic") ||
 		strings.Contains(strings.ToLower(html), "captcha") {
